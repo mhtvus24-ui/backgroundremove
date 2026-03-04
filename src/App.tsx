@@ -1,7 +1,7 @@
 import React, { useState, useCallback, useEffect } from 'react';
 import { useDropzone } from 'react-dropzone';
 import { removeBackground, Config } from '@imgly/background-removal';
-import { Upload, Image as ImageIcon, Download, RefreshCw, Loader2, AlertCircle, CheckCircle2, Trash2, Settings2, FileArchive, Sparkles } from 'lucide-react';
+import { Upload, Image as ImageIcon, Download, RefreshCw, Loader2, AlertCircle, CheckCircle2, Trash2, Settings2, FileArchive, Sparkles, Maximize, Link as LinkIcon, DownloadCloud } from 'lucide-react';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
 import JSZip from 'jszip';
@@ -24,10 +24,40 @@ interface ImageItem {
   error: string | null;
 }
 
+const upscaleImage = async (blob: Blob, scale: number): Promise<Blob> => {
+  if (scale === 1) return blob;
+  
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      const canvas = document.createElement('canvas');
+      canvas.width = img.width * scale;
+      canvas.height = img.height * scale;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) {
+        resolve(blob);
+        return;
+      }
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = 'high';
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      canvas.toBlob((scaledBlob) => {
+        if (scaledBlob) resolve(scaledBlob);
+        else resolve(blob);
+      }, 'image/png');
+    };
+    img.onerror = () => resolve(blob);
+    img.src = URL.createObjectURL(blob);
+  });
+};
+
 export default function App() {
   const [images, setImages] = useState<ImageItem[]>([]);
   const [isProcessingBatch, setIsProcessingBatch] = useState(false);
   const [modelType, setModelType] = useState<'isnet' | 'isnet_quint8' | 'u2net' | 'gemini'>('isnet');
+  const [upscale, setUpscale] = useState<number>(1);
+  const [imageUrlInput, setImageUrlInput] = useState('');
+  const [isFetchingUrl, setIsFetchingUrl] = useState(false);
 
   // Cleanup object URLs to avoid memory leaks
   useEffect(() => {
@@ -191,14 +221,74 @@ export default function App() {
     disabled: isProcessingBatch
   } as any);
 
-  const handleDownload = (item: ImageItem) => {
+  const handleAddUrl = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!imageUrlInput) return;
+    
+    setIsFetchingUrl(true);
+    try {
+      const response = await fetch(imageUrlInput);
+      const blob = await response.blob();
+      
+      const filename = imageUrlInput.split('/').pop()?.split('?')[0] || 'image-from-url.jpg';
+      const file = new File([blob], filename, { type: blob.type });
+      
+      const newItem: ImageItem = {
+        id: Math.random().toString(36).substring(7),
+        file,
+        originalUrl: URL.createObjectURL(file),
+        processedUrl: null,
+        status: 'idle',
+        progressText: '',
+        error: null
+      };
+
+      setImages(prev => [...prev, newItem]);
+      setImageUrlInput('');
+      processBatch([newItem], modelType);
+    } catch (err) {
+      alert('Failed to load image from URL. It might be protected by CORS.');
+    } finally {
+      setIsFetchingUrl(false);
+    }
+  };
+
+  const handleDownload = async (item: ImageItem) => {
     if (!item.processedUrl) return;
+    
+    let downloadUrl = item.processedUrl;
+    
+    if (upscale > 1) {
+      try {
+        const response = await fetch(item.processedUrl);
+        const blob = await response.blob();
+        const scaledBlob = await upscaleImage(blob, upscale);
+        downloadUrl = URL.createObjectURL(scaledBlob);
+      } catch (e) {
+        console.error("Upscaling failed", e);
+      }
+    }
+
     const a = document.createElement('a');
-    a.href = item.processedUrl;
-    a.download = `nobg-${item.file.name.replace(/\\.[^/.]+$/, "")}.png`;
+    a.href = downloadUrl;
+    a.download = `nobg-${item.file.name.replace(/\\.[^/.]+$/, "")}${upscale > 1 ? `-x${upscale}` : ''}.png`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
+    
+    if (upscale > 1) {
+      setTimeout(() => URL.revokeObjectURL(downloadUrl), 1000);
+    }
+  };
+
+  const handleDownloadAllIndividual = async () => {
+    const processedItems = images.filter(img => img.status === 'success' && img.processedUrl);
+    if (processedItems.length === 0) return;
+
+    for (const item of processedItems) {
+      await handleDownload(item);
+      await new Promise(resolve => setTimeout(resolve, 300));
+    }
   };
 
   const handleDownloadAll = async () => {
@@ -217,7 +307,8 @@ export default function App() {
       if (!item.processedUrl) return;
       const response = await fetch(item.processedUrl);
       const blob = await response.blob();
-      zip.file(`nobg-${item.file.name.replace(/\\.[^/.]+$/, "")}.png`, blob);
+      const finalBlob = upscale > 1 ? await upscaleImage(blob, upscale) : blob;
+      zip.file(`nobg-${item.file.name.replace(/\\.[^/.]+$/, "")}${upscale > 1 ? `-x${upscale}` : ''}.png`, finalBlob);
     }));
 
     const content = await zip.generateAsync({ type: 'blob' });
@@ -269,7 +360,20 @@ export default function App() {
           </div>
           <div className="flex items-center gap-4">
             <div className="flex items-center gap-2 text-sm text-zinc-600">
-              <Settings2 className="w-4 h-4" />
+              <Maximize className="w-4 h-4 hidden sm:block" />
+              <select 
+                value={upscale} 
+                onChange={(e) => setUpscale(Number(e.target.value))}
+                className="bg-zinc-100 border-none rounded-md py-1.5 px-3 text-sm font-medium focus:ring-2 focus:ring-indigo-500 outline-none cursor-pointer"
+              >
+                <option value={1}>1x (Original)</option>
+                <option value={2}>2x Upscale</option>
+                <option value={4}>4x Upscale</option>
+                <option value={8}>8x Upscale</option>
+              </select>
+            </div>
+            <div className="flex items-center gap-2 text-sm text-zinc-600">
+              <Settings2 className="w-4 h-4 hidden sm:block" />
               <select 
                 value={modelType} 
                 onChange={handleModelChange}
@@ -301,26 +405,55 @@ export default function App() {
         </div>
 
         {!hasImages ? (
-          <div
-            {...getRootProps()}
-            className={cn(
-              "border-2 border-dashed rounded-3xl p-16 text-center cursor-pointer transition-all duration-200 ease-in-out bg-white max-w-3xl mx-auto",
-              isDragActive 
-                ? "border-indigo-500 bg-indigo-50/50 scale-[1.02]" 
-                : "border-zinc-300 hover:border-indigo-400 hover:bg-zinc-50",
-              isProcessingBatch && "opacity-50 cursor-not-allowed pointer-events-none"
-            )}
-          >
-            <input {...getInputProps()} />
-            <div className="w-24 h-24 bg-indigo-50 rounded-full flex items-center justify-center mx-auto mb-6">
-              <Upload className="w-12 h-12 text-indigo-600" />
+          <div className="max-w-3xl mx-auto">
+            <div
+              {...getRootProps()}
+              className={cn(
+                "border-2 border-dashed rounded-3xl p-16 text-center cursor-pointer transition-all duration-200 ease-in-out bg-white",
+                isDragActive 
+                  ? "border-indigo-500 bg-indigo-50/50 scale-[1.02]" 
+                  : "border-zinc-300 hover:border-indigo-400 hover:bg-zinc-50",
+                isProcessingBatch && "opacity-50 cursor-not-allowed pointer-events-none"
+              )}
+            >
+              <input {...getInputProps()} />
+              <div className="w-24 h-24 bg-indigo-50 rounded-full flex items-center justify-center mx-auto mb-6">
+                <Upload className="w-12 h-12 text-indigo-600" />
+              </div>
+              <h3 className="text-2xl font-semibold text-zinc-900 mb-3">
+                {isDragActive ? "Drop your images here" : "Click or drag multiple images"}
+              </h3>
+              <p className="text-zinc-500 max-w-sm mx-auto text-lg">
+                Supports JPG, PNG, and WebP. Process as many images as you need.
+              </p>
             </div>
-            <h3 className="text-2xl font-semibold text-zinc-900 mb-3">
-              {isDragActive ? "Drop your images here" : "Click or drag multiple images"}
-            </h3>
-            <p className="text-zinc-500 max-w-sm mx-auto text-lg">
-              Supports JPG, PNG, and WebP. Process as many images as you need.
-            </p>
+
+            <div className="mt-8">
+              <div className="relative flex items-center py-4">
+                <div className="flex-grow border-t border-zinc-300"></div>
+                <span className="flex-shrink-0 mx-4 text-zinc-400 text-sm font-medium">OR</span>
+                <div className="flex-grow border-t border-zinc-300"></div>
+              </div>
+              
+              <form onSubmit={handleAddUrl} className="flex gap-2">
+                <input 
+                  type="url" 
+                  value={imageUrlInput}
+                  onChange={e => setImageUrlInput(e.target.value)}
+                  placeholder="Paste an image URL here..."
+                  className="flex-1 px-4 py-3 rounded-xl border border-zinc-300 focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none bg-white shadow-sm"
+                  disabled={isFetchingUrl || isProcessingBatch}
+                />
+                <button 
+                  type="submit"
+                  disabled={!imageUrlInput || isFetchingUrl || isProcessingBatch}
+                  className="px-6 py-3 bg-zinc-900 text-white rounded-xl font-medium hover:bg-zinc-800 disabled:opacity-50 transition-colors flex items-center gap-2 shadow-sm"
+                >
+                  {isFetchingUrl ? <Loader2 className="w-5 h-5 animate-spin" /> : <LinkIcon className="w-5 h-5" />}
+                  Add URL
+                </button>
+              </form>
+            </div>
           </div>
         ) : (
           <div className="space-y-8">
@@ -360,12 +493,23 @@ export default function App() {
                 </button>
                 
                 <button
+                  onClick={handleDownloadAllIndividual}
+                  disabled={processedCount === 0}
+                  className="px-4 py-2 rounded-lg font-medium text-zinc-700 bg-zinc-100 hover:bg-zinc-200 transition-colors flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+                  title="Download files individually"
+                >
+                  <DownloadCloud className="w-4 h-4" />
+                  <span className="hidden sm:inline">Download All</span>
+                </button>
+
+                <button
                   onClick={handleDownloadAll}
                   disabled={processedCount === 0}
                   className="px-5 py-2 rounded-lg font-medium text-white bg-indigo-600 hover:bg-indigo-700 transition-colors flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed shadow-sm"
+                  title="Download all files as a ZIP archive"
                 >
                   <FileArchive className="w-4 h-4" />
-                  Download All ZIP
+                  <span className="hidden sm:inline">Save as ZIP</span>
                 </button>
               </div>
             </div>
