@@ -1,0 +1,5 @@
+{
+  "name": "Local Background Remover",
+  "description": "A precise, fully local background remover using in-browser AI. No cloud storage required.",
+  "requestFramePermissions": []
+}
