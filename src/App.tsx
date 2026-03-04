@@ -18,10 +18,12 @@ interface ImageItem {
   id: string;
   file: File;
   originalUrl: string;
+  baseProcessedUrl: string | null;
   processedUrl: string | null;
   status: ProcessingStatus;
   progressText: string;
   error: string | null;
+  currentScale: number;
 }
 
 const upscaleImage = async (blob: Blob, scale: number): Promise<Blob> => {
@@ -162,7 +164,7 @@ export default function App() {
       
       setImages(prev => prev.map(img => 
         img.id === item.id 
-          ? { ...img, status: 'success', processedUrl: url, progressText: '' } 
+          ? { ...img, status: 'success', baseProcessedUrl: url, processedUrl: url, currentScale: 1, progressText: '' } 
           : img
       ));
     } catch (err: any) {
@@ -194,6 +196,62 @@ export default function App() {
     setIsProcessingBatch(false);
   };
 
+  const handleUpscale = async (item: ImageItem, scale: number) => {
+    if (!item.baseProcessedUrl || item.currentScale === scale) return;
+    
+    setImages(prev => prev.map(img => 
+      img.id === item.id 
+        ? { ...img, status: 'processing', progressText: `Upscaling ${scale}x...` } 
+        : img
+    ));
+
+    try {
+      const response = await fetch(item.baseProcessedUrl);
+      const blob = await response.blob();
+      const scaledBlob = await upscaleImage(blob, scale);
+      const newUrl = URL.createObjectURL(scaledBlob);
+      
+      setImages(prev => prev.map(img => {
+        if (img.id === item.id) {
+          // Revoke old processedUrl if it's not the base one
+          if (img.processedUrl && img.processedUrl !== img.baseProcessedUrl) {
+            URL.revokeObjectURL(img.processedUrl);
+          }
+          return { ...img, status: 'success', processedUrl: newUrl, currentScale: scale, progressText: '' };
+        }
+        return img;
+      }));
+    } catch (err) {
+      console.error("Upscaling failed", err);
+      setImages(prev => prev.map(img => 
+        img.id === item.id 
+          ? { ...img, status: 'success', progressText: '' } // revert status
+          : img
+      ));
+    }
+  };
+
+  const handleBatchUpscale = async (scale: number) => {
+    const itemsToUpscale = images.filter(img => img.status === 'success' && img.baseProcessedUrl && img.currentScale !== scale);
+    if (itemsToUpscale.length === 0) return;
+
+    setIsProcessingBatch(true);
+    for (const item of itemsToUpscale) {
+      // Re-fetch the item from state to ensure we have the latest
+      const currentItem = await new Promise<ImageItem | undefined>(resolve => {
+        setImages(currentImages => {
+          resolve(currentImages.find(i => i.id === item.id));
+          return currentImages;
+        });
+      });
+      
+      if (currentItem && currentItem.status === 'success') {
+        await handleUpscale(currentItem, scale);
+      }
+    }
+    setIsProcessingBatch(false);
+  };
+
   const onDrop = useCallback((acceptedFiles: File[]) => {
     if (acceptedFiles.length === 0) return;
 
@@ -201,10 +259,12 @@ export default function App() {
       id: Math.random().toString(36).substring(7),
       file,
       originalUrl: URL.createObjectURL(file),
+      baseProcessedUrl: null,
       processedUrl: null,
       status: 'idle',
       progressText: '',
-      error: null
+      error: null,
+      currentScale: 1
     }));
 
     setImages(prev => [...prev, ...newItems]);
@@ -237,10 +297,12 @@ export default function App() {
         id: Math.random().toString(36).substring(7),
         file,
         originalUrl: URL.createObjectURL(file),
+        baseProcessedUrl: null,
         processedUrl: null,
         status: 'idle',
         progressText: '',
-        error: null
+        error: null,
+        currentScale: 1
       };
 
       setImages(prev => [...prev, newItem]);
@@ -320,7 +382,8 @@ export default function App() {
       const item = prev.find(i => i.id === id);
       if (item) {
         URL.revokeObjectURL(item.originalUrl);
-        if (item.processedUrl) URL.revokeObjectURL(item.processedUrl);
+        if (item.baseProcessedUrl) URL.revokeObjectURL(item.baseProcessedUrl);
+        if (item.processedUrl && item.processedUrl !== item.baseProcessedUrl) URL.revokeObjectURL(item.processedUrl);
       }
       return prev.filter(i => i.id !== id);
     });
@@ -329,7 +392,8 @@ export default function App() {
   const handleReset = () => {
     images.forEach(img => {
       URL.revokeObjectURL(img.originalUrl);
-      if (img.processedUrl) URL.revokeObjectURL(img.processedUrl);
+      if (img.baseProcessedUrl) URL.revokeObjectURL(img.baseProcessedUrl);
+      if (img.processedUrl && img.processedUrl !== img.baseProcessedUrl) URL.revokeObjectURL(img.processedUrl);
     });
     setImages([]);
   };
@@ -359,19 +423,6 @@ export default function App() {
             </h1>
           </div>
           <div className="flex items-center gap-4">
-            <div className="flex items-center gap-2 text-sm text-zinc-600">
-              <Maximize className="w-4 h-4 hidden sm:block" />
-              <select 
-                value={upscale} 
-                onChange={(e) => setUpscale(Number(e.target.value))}
-                className="bg-zinc-100 border-none rounded-md py-1.5 px-3 text-sm font-medium focus:ring-2 focus:ring-indigo-500 outline-none cursor-pointer"
-              >
-                <option value={1}>1x (Original)</option>
-                <option value={2}>2x Upscale</option>
-                <option value={4}>4x Upscale</option>
-                <option value={8}>8x Upscale</option>
-              </select>
-            </div>
             <div className="flex items-center gap-2 text-sm text-zinc-600">
               <Settings2 className="w-4 h-4 hidden sm:block" />
               <select 
@@ -603,18 +654,42 @@ export default function App() {
                     </button>
                   </div>
                   
-                  <div className="p-4 border-t border-zinc-100 flex items-center justify-between bg-zinc-50/50">
-                    <div className="truncate text-sm font-medium text-zinc-700 pr-4" title={item.file.name}>
-                      {item.file.name}
+                  <div className="p-4 border-t border-zinc-100 flex flex-col gap-3 bg-zinc-50/50">
+                    <div className="flex items-center justify-between">
+                      <div className="truncate text-sm font-medium text-zinc-700 pr-4" title={item.file.name}>
+                        {item.file.name}
+                      </div>
+                      <button
+                        onClick={() => handleDownload(item)}
+                        disabled={item.status !== 'success'}
+                        className="p-2 rounded-lg text-indigo-600 hover:bg-indigo-50 disabled:opacity-30 disabled:hover:bg-transparent transition-colors flex-shrink-0"
+                        title="Download"
+                      >
+                        <Download className="w-5 h-5" />
+                      </button>
                     </div>
-                    <button
-                      onClick={() => handleDownload(item)}
-                      disabled={item.status !== 'success'}
-                      className="p-2 rounded-lg text-indigo-600 hover:bg-indigo-50 disabled:opacity-30 disabled:hover:bg-transparent transition-colors flex-shrink-0"
-                      title="Download"
-                    >
-                      <Download className="w-5 h-5" />
-                    </button>
+                    {item.status === 'success' && (
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-xs text-zinc-500">Quality:</span>
+                        <div className="flex gap-1">
+                          {[1, 2, 4, 8].map(scale => (
+                            <button
+                              key={scale}
+                              onClick={() => handleUpscale(item, scale)}
+                              disabled={item.currentScale === scale || isProcessingBatch}
+                              className={cn(
+                                "px-2 py-1 text-xs font-medium rounded-md transition-colors disabled:opacity-50",
+                                item.currentScale === scale 
+                                  ? "bg-indigo-100 text-indigo-700" 
+                                  : "bg-white border border-zinc-200 text-zinc-600 hover:bg-zinc-50"
+                              )}
+                            >
+                              {scale}x
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    )}
                   </div>
                 </div>
               ))}
